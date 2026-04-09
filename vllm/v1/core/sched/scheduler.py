@@ -1310,6 +1310,20 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
 
+            # Soft thinking: suppress tokens from output during thinking.
+            soft_mask = model_runner_output.soft_thinking_mask
+            is_soft_thinking = (
+                soft_mask is not None
+                and req_index < len(soft_mask)
+                and soft_mask[req_index]
+            )
+            if is_soft_thinking and new_token_ids:
+                request.soft_thinking_active = True
+                request.num_soft_thinking_steps += len(new_token_ids)
+                new_token_ids = []
+            elif request.soft_thinking_active and not is_soft_thinking:
+                request.soft_thinking_active = False
+
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
@@ -1345,7 +1359,11 @@ class Scheduler(SchedulerInterface):
             ):
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
-            if new_token_ids and self.structured_output_manager.should_advance(request):
+            if (
+                new_token_ids
+                and not request.soft_thinking_active
+                and self.structured_output_manager.should_advance(request)
+            ):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
@@ -1362,13 +1380,14 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            has_soft_thinking = request.num_soft_thinking_steps > 0
             if (
                 new_token_ids
                 or pooler_output is not None
                 or kv_transfer_params
                 or stopped
+                or is_soft_thinking
             ):
-                # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
@@ -1384,6 +1403,10 @@ class Scheduler(SchedulerInterface):
                         num_cached_tokens=request.num_cached_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        num_soft_thinking_steps=(
+                            request.num_soft_thinking_steps
+                            if has_soft_thinking else 0
+                        ),
                     )
                 )
             else:

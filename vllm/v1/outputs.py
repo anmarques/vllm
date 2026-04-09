@@ -184,6 +184,10 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # Per-request mask: True if the request is in soft thinking mode.
+    # When set, the scheduler suppresses tokens from the API output.
+    soft_thinking_mask: list[bool] | None = None
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

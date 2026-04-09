@@ -165,6 +165,10 @@ class Request:
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
+        # Soft thinking state
+        self.soft_thinking_active: bool = False
+        self.num_soft_thinking_steps: int = 0
+
         # Used for streaming
         self.resumable = resumable
         # None entry in the queue means finished.

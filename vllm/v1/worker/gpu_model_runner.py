@@ -357,6 +357,7 @@ class GPUModelRunner(
 
         self.is_pooling_model = model_config.runner_type == "pooling"
         self.enable_prompt_embeds = model_config.enable_prompt_embeds
+        self.soft_thinking_enabled = model_config.enable_soft_thinking
         self.is_multimodal_raw_input_only_model = (
             model_config.is_multimodal_raw_input_only_model
         )
@@ -1097,6 +1098,10 @@ class GPUModelRunner(
         self.input_batch.condense()
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
+
+        if self.soft_thinking_enabled:
+            self._sync_soft_thinking_state()
+
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
@@ -1279,7 +1284,7 @@ class GPUModelRunner(
         if self.input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
-            if self.enable_prompt_embeds:
+            if self.enable_prompt_embeds or self.soft_thinking_enabled:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
             return
@@ -1329,7 +1334,7 @@ class GPUModelRunner(
             # If not all requests are decodes from the last iteration,
             # We need to copy the input_ids_cpu to the GPU first.
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
-            if self.enable_prompt_embeds:
+            if self.enable_prompt_embeds or self.soft_thinking_enabled:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
         if num_commmon_tokens == 0:
@@ -1345,7 +1350,7 @@ class GPUModelRunner(
                 self.input_batch.prev_sampled_token_ids[:num_commmon_tokens, 0],
                 non_blocking=True,
             )
-            if self.enable_prompt_embeds:
+            if self.enable_prompt_embeds or self.soft_thinking_enabled:
                 self.is_token_ids.gpu[:num_commmon_tokens] = True
             return
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
@@ -1445,6 +1450,13 @@ class GPUModelRunner(
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
+        if self.soft_thinking_enabled:
+            self.req_indices_gpu = torch.from_numpy(
+                req_indices[:total_num_scheduled_tokens].copy()
+            ).to(self.device, non_blocking=True)
+        else:
+            self.req_indices_gpu = None
+
         # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
         # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
@@ -1485,7 +1497,7 @@ class GPUModelRunner(
             token_indices_tensor,
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
         )
-        if self.enable_prompt_embeds:
+        if self.enable_prompt_embeds or self.soft_thinking_enabled:
             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
             torch.index_select(
                 is_token_ids,
@@ -1607,6 +1619,11 @@ class GPUModelRunner(
                 draft_token_ids,
             ) in scheduler_output.scheduled_spec_decode_tokens.items():
                 req_idx = self.input_batch.req_id_to_index[req_id]
+                if (
+                    self.soft_thinking_enabled
+                    and self.is_in_soft_thinking[req_idx]
+                ):
+                    continue
                 num_draft_tokens[req_idx] = len(draft_token_ids)
                 if (
                     self.input_batch.num_computed_tokens_cpu[req_idx]
@@ -2741,29 +2758,37 @@ class GPUModelRunner(
                 **self._init_model_kwargs(),
                 **self._extract_mm_kwargs(scheduler_output),
             }
-        elif self.enable_prompt_embeds and is_first_rank:
-            # Get the input embeddings for the tokens that are not input embeds,
-            # then put them into the appropriate positions.
-            # TODO(qthequartermasterman): Since even when prompt embeds are
-            # enabled, (a) not all requests will use prompt embeds, and (b)
-            # after the initial prompt is processed, the rest of the generated
-            # tokens will be token ids, it is not desirable to have the
-            # embedding layer outside of the CUDA graph all the time. The v0
-            # engine avoids this by "double compiling" the CUDA graph, once
-            # with input_ids and again with inputs_embeds, for all num_tokens.
-            # If a batch only has token ids, then including the embedding layer
-            # in the CUDA graph will be more performant (like in the else case
-            # below).
+        elif (self.enable_prompt_embeds or self.soft_thinking_enabled) \
+                and is_first_rank:
+            # Synchronize soft embed writes from the previous step.
+            if self.soft_thinking_enabled:
+                self.soft_thinking_sync_event.synchronize()
+
             token_ids_idx = (
                 self.is_token_ids.gpu[:num_scheduled_tokens]
                 .nonzero(as_tuple=False)
                 .squeeze(1)
             )
-            # Some tokens ids may need to become embeds
             if token_ids_idx.numel() > 0:
                 token_ids = self.input_ids.gpu[token_ids_idx]
-                tokens_to_embeds = self.model.embed_input_ids(input_ids=token_ids)
+                tokens_to_embeds = self.model.embed_input_ids(
+                    input_ids=token_ids
+                )
                 self.inputs_embeds.gpu[token_ids_idx] = tokens_to_embeds
+
+            if self.soft_thinking_enabled:
+                soft_idx = (
+                    (~self.is_token_ids.gpu[:num_scheduled_tokens])
+                    .nonzero(as_tuple=False)
+                    .squeeze(1)
+                )
+                if soft_idx.numel() > 0:
+                    req_indices_gpu = self.req_indices_gpu
+                    if req_indices_gpu is not None:
+                        soft_req_indices = req_indices_gpu[soft_idx]
+                        self.inputs_embeds.gpu[soft_idx] = (
+                            self.soft_embed_buffer[soft_req_indices]
+                        )
 
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = self._init_model_kwargs()
@@ -2839,6 +2864,84 @@ class GPUModelRunner(
             sampling_metadata,
         )
         return sampler_output
+
+    def _compute_soft_thinking_embeddings(
+        self,
+        logits: torch.Tensor,
+        sampler_output: SamplerOutput,
+    ) -> None:
+        """Replace sampling with soft embeddings for requests in thinking mode.
+
+        For requests in soft thinking: compute probs @ embed_weight.
+        For requests NOT yet in soft thinking: detect start-of-thinking token.
+        """
+        num_reqs = len(self.input_batch.req_ids)
+        sampled = sampler_output.sampled_token_ids
+
+        for req_idx in range(num_reqs):
+            req_id = self.input_batch.req_ids[req_idx]
+            if req_id is None:
+                continue
+            req_state = self.requests.get(req_id)
+
+            if self.is_in_soft_thinking[req_idx]:
+                req_logits = logits[req_idx].float()
+                probs = torch.softmax(req_logits, dim=-1)
+                top_token = probs.argmax(dim=-1).item()
+
+                if top_token == self.think_end_token_id:
+                    self.is_in_soft_thinking[req_idx] = False
+                    self.has_pending_soft_embed[req_idx] = False
+                    sampled[req_idx] = [self.think_end_token_id]
+                    if req_state is not None:
+                        req_state.soft_thinking_active = False
+                        req_state.has_pending_soft_embed = False
+                else:
+                    soft_embed = self._compute_soft_embed_tp(
+                        probs.unsqueeze(0)
+                    ).squeeze(0)
+                    self.soft_embed_buffer[req_idx] = soft_embed
+                    self.has_pending_soft_embed[req_idx] = True
+                    sampled[req_idx] = [top_token]
+                    if req_state is not None:
+                        req_state.has_pending_soft_embed = True
+            else:
+                if (
+                    sampled[req_idx]
+                    and sampled[req_idx][0] == self.think_start_token_id
+                ):
+                    self.is_in_soft_thinking[req_idx] = True
+                    if req_state is not None:
+                        req_state.soft_thinking_active = True
+
+        self.soft_thinking_sync_event.record()
+
+    def _compute_soft_embed_tp(self, probs: torch.Tensor) -> torch.Tensor:
+        """TP-aware computation of probs @ embed_weight.
+
+        Args:
+            probs: (batch, org_vocab_size) probability distribution.
+
+        Returns:
+            (batch, hidden_dim) soft embedding.
+        """
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        org_start = self.soft_thinking_tp_org_start
+        org_end = self.soft_thinking_tp_org_end
+        local_offset = self.soft_thinking_tp_local_offset
+        num_real = org_end - org_start
+
+        local_probs = probs[:, org_start:org_end]
+        local_embed = self.embed_weight[
+            local_offset:local_offset + num_real, :
+        ]
+        partial = local_probs @ local_embed
+
+        if self.soft_thinking_tp_size > 1:
+            partial = tensor_model_parallel_all_reduce(partial)
+
+        return partial
 
     def _bookkeeping_sync(
         self,
@@ -2944,12 +3047,26 @@ class GPUModelRunner(
             )
 
             self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
-            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
 
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
-            req_state.output_token_ids.extend(sampled_ids)
+
+            if (
+                self.soft_thinking_enabled
+                and self.has_pending_soft_embed[req_idx]
+            ):
+                self.input_batch.is_token_ids[
+                    req_idx, start_idx:end_idx
+                ] = False
+                if req_state.soft_thinking_token_ids is None:
+                    req_state.soft_thinking_token_ids = []
+                req_state.soft_thinking_token_ids.extend(sampled_ids)
+            else:
+                self.input_batch.is_token_ids[
+                    req_idx, start_idx:end_idx
+                ] = True
+                req_state.output_token_ids.extend(sampled_ids)
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -3623,6 +3740,9 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        if self.soft_thinking_enabled and logits is not None:
+            self._compute_soft_thinking_embeddings(logits, sampler_output)
+
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -3727,6 +3847,16 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            soft_mask = None
+            if self.soft_thinking_enabled:
+                num_out = len(req_ids_output_copy)
+                soft_mask = [
+                    bool(self.has_pending_soft_embed[
+                        self.input_batch.req_id_to_index.get(rid, 0)
+                    ])
+                    for rid in req_ids_output_copy[:num_out]
+                ]
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -3738,6 +3868,7 @@ class GPUModelRunner(
                 if self.supports_mm_inputs
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
+                soft_thinking_mask=soft_mask,
                 cudagraph_stats=cudagraph_stats,
             )
 
@@ -4183,6 +4314,10 @@ class GPUModelRunner(
             drafter_model := getattr(drafter, "model", None)
         ):
             prepare_communication_buffer_for_model(drafter_model)
+
+        if self.soft_thinking_enabled:
+            self._init_soft_thinking()
+
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
@@ -4265,6 +4400,111 @@ class GPUModelRunner(
             return tuple(layer_ids)
 
         return None
+
+    def _init_soft_thinking(self) -> None:
+        """Initialize soft thinking state after model is loaded."""
+        from vllm.reasoning import ReasoningParserManager
+        from vllm.tokenizers.registry import get_tokenizer
+
+        so_cfg = self.vllm_config.structured_outputs_config
+        assert so_cfg is not None and so_cfg.reasoning_parser
+
+        tokenizer = get_tokenizer(
+            self.model_config.tokenizer,
+            trust_remote_code=self.model_config.trust_remote_code,
+        )
+        parser_cls = ReasoningParserManager.get_reasoning_parser(
+            so_cfg.reasoning_parser
+        )
+        parser = parser_cls(tokenizer)
+
+        self.think_start_token_id: int | None = getattr(
+            parser, "start_token_id", None
+        )
+        self.think_end_token_id: int | None = getattr(
+            parser, "end_token_id", None
+        )
+
+        if self.think_start_token_id is None or self.think_end_token_id is None:
+            raise ValueError(
+                f"Reasoning parser '{so_cfg.reasoning_parser}' does not have "
+                "single-token start_token_id / end_token_id. "
+                "Soft thinking requires single-token delimiters."
+            )
+
+        embed_tokens = self._resolve_embed_tokens()
+        self.embed_weight: torch.Tensor = embed_tokens.weight
+        shard = embed_tokens.shard_indices
+        self.soft_thinking_tp_org_start = shard.org_vocab_start_index
+        self.soft_thinking_tp_org_end = shard.org_vocab_end_index
+        self.soft_thinking_tp_local_offset = (
+            shard.org_vocab_start_index - shard.padded_org_vocab_start_index
+        )
+        self.soft_thinking_tp_size = embed_tokens.tp_size
+        self.soft_thinking_org_vocab_size = embed_tokens.org_vocab_size
+
+        hidden_dim = self.inputs_embeds_size
+        self.is_in_soft_thinking = np.zeros(self.max_num_reqs, dtype=bool)
+        self.has_pending_soft_embed = np.zeros(self.max_num_reqs, dtype=bool)
+        self.soft_embed_buffer = torch.zeros(
+            self.max_num_reqs, hidden_dim, dtype=self.dtype, device=self.device
+        )
+        self.soft_thinking_sync_event = torch.cuda.Event()
+
+        logger.info(
+            "Soft thinking enabled: start_token=%d, end_token=%d, "
+            "embed_dim=%d, tp_size=%d",
+            self.think_start_token_id,
+            self.think_end_token_id,
+            hidden_dim,
+            self.soft_thinking_tp_size,
+        )
+
+    def _sync_soft_thinking_state(self) -> None:
+        """Rebuild runner-level soft thinking arrays from CachedRequestState.
+
+        Must be called after condense/swap_states to keep req_idx-indexed
+        arrays consistent with the current batch layout.  On preemption
+        recovery, the GPU soft_embed_buffer entry is lost; we clear the
+        pending flag so the next step uses a discrete embedding fallback.
+        """
+        self.is_in_soft_thinking[:] = False
+        self.has_pending_soft_embed[:] = False
+
+        for req_id in self.input_batch.req_ids:
+            if req_id is None:
+                continue
+            new_idx = self.input_batch.req_id_to_index[req_id]
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            if req_state.soft_thinking_active:
+                self.is_in_soft_thinking[new_idx] = True
+            if req_state.has_pending_soft_embed:
+                self.has_pending_soft_embed[new_idx] = True
+
+    def _resolve_embed_tokens(self):
+        """Find the VocabParallelEmbedding layer in the model."""
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            VocabParallelEmbedding,
+        )
+
+        model = self.get_model()
+        for attr_path in ("model.embed_tokens", "transformer.wte",
+                          "model.decoder.embed_tokens"):
+            obj = model
+            try:
+                for part in attr_path.split("."):
+                    obj = getattr(obj, part)
+                if isinstance(obj, VocabParallelEmbedding):
+                    return obj
+            except AttributeError:
+                continue
+        raise RuntimeError(
+            "Could not find VocabParallelEmbedding (embed_tokens) in the "
+            "model. Soft thinking requires access to the embedding weight. "
+            f"Model type: {type(model).__name__}"
+        )
 
     def reload_weights(self) -> None:
         assert getattr(self, "model", None) is not None, (
@@ -4687,7 +4927,7 @@ class GPUModelRunner(
                     **model_kwargs,
                     **self._dummy_mm_kwargs(num_reqs),
                 }
-            elif self.enable_prompt_embeds:
+            elif self.enable_prompt_embeds or self.soft_thinking_enabled:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
                 model_kwargs = self._init_model_kwargs()

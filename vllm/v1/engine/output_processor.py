@@ -649,6 +649,11 @@ class OutputProcessor:
                 kv_transfer_params,
                 routed_experts,
             ):
+                if engine_core_output.num_soft_thinking_steps > 0:
+                    request_output.num_soft_thinking_steps = (
+                        engine_core_output.num_soft_thinking_steps
+                    )
+
                 if req_state.streaming_input:
                     request_output.finished = False
 

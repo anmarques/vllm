@@ -49,6 +49,13 @@ class CachedRequestState:
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0
 
+    # Soft thinking: argmax tokens generated during the soft thinking phase.
+    # These are kept separate from output_token_ids to avoid polluting
+    # repetition/frequency/presence penalties and stop-string matching.
+    soft_thinking_token_ids: list[int] | None = None
+    soft_thinking_active: bool = False
+    has_pending_soft_embed: bool = False
+
     # for pooling models
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None

@@ -838,6 +838,18 @@ class VllmConfig:
                 "Modify KVEventsConfig.enable_kv_cache_events "
                 "to True to enable."
             )
+        if (
+            self.model_config is not None
+            and self.model_config.enable_soft_thinking
+        ):
+            so_cfg = self.structured_outputs_config
+            if so_cfg is None or not so_cfg.reasoning_parser:
+                raise ValueError(
+                    "--enable-soft-thinking requires a reasoning parser to be "
+                    "configured via --reasoning-parser (e.g. 'qwen3', "
+                    "'deepseek_r1')."
+                )
+
         current_platform.check_and_update_config(self)
 
         # If DCP, ensure the block size is right.

@@ -233,6 +233,11 @@ class ModelConfig:
 
     WARNING: The vLLM engine may crash if incorrect shape of embeddings is passed.
     Only enable this flag for trusted users!"""
+    enable_soft_thinking: bool = False
+    """If `True`, replaces discrete token sampling during the thinking phase
+    with a continuous soft embedding (probability-weighted average over the
+    embedding matrix). Requires a reasoning parser (``--reasoning-parser``)
+    whose start/end tokens are single token IDs in the vocabulary."""
     served_model_name: str | list[str] | None = None
     """The model name(s) used in the API. If multiple names are provided, the
     server will respond to any of the provided names. The model name in the
