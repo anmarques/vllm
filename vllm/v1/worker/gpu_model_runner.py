@@ -2935,13 +2935,13 @@ class GPUModelRunner(
         local_probs = probs[:, org_start:org_end]
         local_embed = self.embed_weight[
             local_offset:local_offset + num_real, :
-        ]
+        ].float()
         partial = local_probs @ local_embed
 
         if self.soft_thinking_tp_size > 1:
             partial = tensor_model_parallel_all_reduce(partial)
 
-        return partial
+        return partial.to(self.dtype)
 
     def _bookkeeping_sync(
         self,
