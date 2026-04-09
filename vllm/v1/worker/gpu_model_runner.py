@@ -2883,6 +2883,7 @@ class GPUModelRunner(
             if req_id is None:
                 continue
             req_state = self.requests.get(req_id)
+            sampled_token = sampled[req_idx, 0].item()
 
             if self.is_in_soft_thinking[req_idx]:
                 req_logits = logits[req_idx].float()
@@ -2892,7 +2893,7 @@ class GPUModelRunner(
                 if top_token == self.think_end_token_id:
                     self.is_in_soft_thinking[req_idx] = False
                     self.has_pending_soft_embed[req_idx] = False
-                    sampled[req_idx] = [self.think_end_token_id]
+                    sampled[req_idx, 0] = self.think_end_token_id
                     if req_state is not None:
                         req_state.soft_thinking_active = False
                         req_state.has_pending_soft_embed = False
@@ -2902,14 +2903,11 @@ class GPUModelRunner(
                     ).squeeze(0)
                     self.soft_embed_buffer[req_idx] = soft_embed
                     self.has_pending_soft_embed[req_idx] = True
-                    sampled[req_idx] = [top_token]
+                    sampled[req_idx, 0] = top_token
                     if req_state is not None:
                         req_state.has_pending_soft_embed = True
             else:
-                if (
-                    sampled[req_idx]
-                    and sampled[req_idx][0] == self.think_start_token_id
-                ):
+                if sampled_token == self.think_start_token_id:
                     self.is_in_soft_thinking[req_idx] = True
                     if req_state is not None:
                         req_state.soft_thinking_active = True
