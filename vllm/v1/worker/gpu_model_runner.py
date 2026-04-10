@@ -2865,6 +2865,46 @@ class GPUModelRunner(
         )
         return sampler_output
 
+    def _apply_soft_thinking_sampling_params(
+        self,
+        req_logits: torch.Tensor,
+        req_idx: int,
+    ) -> torch.Tensor:
+        """Apply temperature, top-k, and top-p to logits, then return probs.
+
+        The exit criterion (argmax == end_token) is evaluated on the raw
+        logits before any filtering, so temperature/top-k/top-p only shape
+        the soft embedding, not the exit decision.
+        """
+        temperature = float(self.input_batch.temperature_cpu[req_idx])
+        top_k = int(self.input_batch.top_k_cpu[req_idx])
+        top_p = float(self.input_batch.top_p_cpu[req_idx])
+
+        if temperature > 0:
+            req_logits = req_logits / temperature
+
+        if top_k > 0:
+            topk_vals, _ = torch.topk(req_logits, top_k)
+            threshold = topk_vals[-1]
+            req_logits = req_logits.masked_fill(
+                req_logits < threshold, float("-inf")
+            )
+
+        probs = torch.softmax(req_logits, dim=-1)
+
+        if top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(
+                probs, descending=True
+            )
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            mask = cumulative - sorted_probs > top_p
+            sorted_probs[mask] = 0.0
+            sorted_probs /= sorted_probs.sum()
+            probs = torch.zeros_like(probs)
+            probs.scatter_(0, sorted_indices, sorted_probs)
+
+        return probs
+
     def _compute_soft_thinking_embeddings(
         self,
         logits: torch.Tensor,
@@ -2887,8 +2927,9 @@ class GPUModelRunner(
 
             if self.is_in_soft_thinking[req_idx]:
                 req_logits = logits[req_idx].float()
-                probs = torch.softmax(req_logits, dim=-1)
-                top_token = probs.argmax(dim=-1).item()
+
+                # Exit criterion: raw argmax (before temp/top-k/top-p).
+                top_token = req_logits.argmax(dim=-1).item()
 
                 if top_token == self.think_end_token_id:
                     self.is_in_soft_thinking[req_idx] = False
@@ -2898,6 +2939,9 @@ class GPUModelRunner(
                         req_state.soft_thinking_active = False
                         req_state.has_pending_soft_embed = False
                 else:
+                    probs = self._apply_soft_thinking_sampling_params(
+                        req_logits, req_idx
+                    )
                     soft_embed = self._compute_soft_embed_tp(
                         probs.unsqueeze(0)
                     ).squeeze(0)
